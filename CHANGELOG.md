@@ -1,5 +1,11 @@
 # Changelog
 
+## \[0.27.1]
+
+- Update the value returned on a `None` value of `ClassDecl::new("WryDownloadDelegate", class!(NSObject))`
+  from `UIViewController` to `WryDownloadDelegate`.
+  - [7795356](https://github.com/tauri-apps/wry/commit/7795356a45b1bd015fad0e9973fc5af58c8c339b) fix: WryDownloadDelegate call after first time on 2023-02-20
+
 ## \[0.27.0]
 
 - Add function to dispatch closure with the Android context.
