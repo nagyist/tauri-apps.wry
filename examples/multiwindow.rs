@@ -8,7 +8,7 @@ use tao::{
   event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
   window::{Window, WindowBuilder, WindowId},
 };
-use wry::{WebView, WebViewBuilder};
+use wry::{http::Request, WebView, WebViewBuilder};
 
 enum UserEvent {
   CloseWindow(WindowId),
@@ -21,12 +21,12 @@ fn main() -> wry::Result<()> {
   let mut webviews = HashMap::new();
   let proxy = event_loop.create_proxy();
 
-  let new_window = create_new_window(
+  let (window, webview) = create_new_window(
     format!("Window {}", webviews.len() + 1),
     &event_loop,
     proxy.clone(),
   );
-  webviews.insert(new_window.0.id(), (new_window.0, new_window.1));
+  webviews.insert(window.id(), (window, webview));
 
   event_loop.run(move |event, event_loop, control_flow| {
     *control_flow = ControlFlow::Wait;
@@ -43,12 +43,12 @@ fn main() -> wry::Result<()> {
         }
       }
       Event::UserEvent(UserEvent::NewWindow) => {
-        let new_window = create_new_window(
+        let (window, webview) = create_new_window(
           format!("Window {}", webviews.len() + 1),
           event_loop,
           proxy.clone(),
         );
-        webviews.insert(new_window.0.id(), (new_window.0, new_window.1));
+        webviews.insert(window.id(), (window, webview));
       }
       Event::UserEvent(UserEvent::CloseWindow(id)) => {
         webviews.remove(&id);
@@ -75,41 +75,24 @@ fn create_new_window(
     .build(event_loop)
     .unwrap();
   let window_id = window.id();
-  let handler = move |req: String| match req.as_str() {
-    "new-window" => {
-      let _ = proxy.send_event(UserEvent::NewWindow);
+  let handler = move |req: Request<String>| {
+    let body = req.body();
+    match body.as_str() {
+      "new-window" => {
+        let _ = proxy.send_event(UserEvent::NewWindow);
+      }
+      "close" => {
+        let _ = proxy.send_event(UserEvent::CloseWindow(window_id));
+      }
+      _ if body.starts_with("change-title") => {
+        let title = body.replace("change-title:", "");
+        let _ = proxy.send_event(UserEvent::NewTitle(window_id, title));
+      }
+      _ => {}
     }
-    "close" => {
-      let _ = proxy.send_event(UserEvent::CloseWindow(window_id));
-    }
-    _ if req.starts_with("change-title") => {
-      let title = req.replace("change-title:", "");
-      let _ = proxy.send_event(UserEvent::NewTitle(window_id, title));
-    }
-    _ => {}
   };
 
-  #[cfg(any(
-    target_os = "windows",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-  ))]
-  let builder = WebViewBuilder::new(&window);
-
-  #[cfg(not(any(
-    target_os = "windows",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-  )))]
-  let builder = {
-    use tao::platform::unix::WindowExtUnix;
-    let vbox = window.default_vbox().unwrap();
-    WebViewBuilder::new_gtk(vbox)
-  };
-
-  let webview = builder
+  let builder = WebViewBuilder::new()
     .with_html(
       r#"
         <button onclick="window.ipc.postMessage('new-window')">Open a new window</button>
@@ -117,9 +100,26 @@ fn create_new_window(
         <input oninput="window.ipc.postMessage(`change-title:${this.value}`)" />
     "#,
     )
-    .unwrap()
-    .with_ipc_handler(handler)
-    .build()
-    .unwrap();
+    .with_ipc_handler(handler);
+
+  #[cfg(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+  ))]
+  let webview = builder.build(&window).unwrap();
+  #[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+  )))]
+  let webview = {
+    use tao::platform::unix::WindowExtUnix;
+    use wry::WebViewBuilderExtUnix;
+    let vbox = window.default_vbox().unwrap();
+    builder.build_gtk(vbox).unwrap()
+  };
   (window, webview)
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use super::{PageLoadEvent, WebContext, WebViewAttributes, RGBA};
+use super::{PageLoadEvent, WebViewAttributes, RGBA};
 use crate::{RequestAsyncResponder, Result};
 use base64::{engine::general_purpose, Engine};
 use crossbeam_channel::*;
@@ -17,15 +17,27 @@ use jni::{
   JNIEnv,
 };
 use kuchiki::NodeRef;
-use ndk::looper::{FdEvent, ForeignLooper};
+use ndk::looper::{FdEvent, ThreadLooper};
 use once_cell::sync::OnceCell;
+use raw_window_handle::HasWindowHandle;
 use sha2::{Digest, Sha256};
-use std::{borrow::Cow, sync::mpsc::channel};
-use url::Url;
+use std::{
+  borrow::Cow,
+  cell::RefCell,
+  collections::HashMap,
+  os::fd::{AsFd as _, AsRawFd as _},
+  sync::{mpsc::channel, Mutex},
+  time::Duration,
+};
 
 pub(crate) mod binding;
 mod main_pipe;
-use main_pipe::{CreateWebViewAttributes, MainPipe, WebViewMessage, MAIN_PIPE};
+use main_pipe::{CreateWebViewAttributes, MainPipe, MainPipeState, WebViewMessage, MAIN_PIPE};
+
+use crate::util::Counter;
+
+static COUNTER: Counter = Counter::new();
+const MAIN_PIPE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Context<'a, 'b> {
   pub env: &'a mut JNIEnv<'b>,
@@ -33,9 +45,22 @@ pub struct Context<'a, 'b> {
   pub webview: &'a JObject<'b>,
 }
 
+pub(crate) struct StaticCell<T>(RefCell<T>);
+
+unsafe impl<T> Send for StaticCell<T> {}
+unsafe impl<T> Sync for StaticCell<T> {}
+
+impl<T> std::ops::Deref for StaticCell<T> {
+  type Target = RefCell<T>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
 macro_rules! define_static_handlers {
   ($($var:ident = $type_name:ident { $($fields:ident:$types:ty),+ $(,)? });+ $(;)?) => {
-    $(pub static $var: once_cell::sync::OnceCell<$type_name> = once_cell::sync::OnceCell::new();
+    $(pub static $var: StaticCell<Option<$type_name>> = StaticCell(RefCell::new(None));
     pub struct $type_name {
       $($fields: $types,)*
     }
@@ -52,23 +77,31 @@ macro_rules! define_static_handlers {
 }
 
 define_static_handlers! {
-  IPC =  UnsafeIpc { handler: Box<dyn Fn(String)> };
-  REQUEST_HANDLER = UnsafeRequestHandler { handler:  Box<dyn Fn(Request<Vec<u8>>) -> Option<HttpResponse<Cow<'static, [u8]>>>> };
+  IPC =  UnsafeIpc { handler: Box<dyn Fn(Request<String>)> };
+  REQUEST_HANDLER = UnsafeRequestHandler { handler:  Box<dyn Fn(&str, Request<Vec<u8>>, bool) -> Option<HttpResponse<Cow<'static, [u8]>>>> };
   TITLE_CHANGE_HANDLER = UnsafeTitleHandler { handler: Box<dyn Fn(String)> };
   URL_LOADING_OVERRIDE = UnsafeUrlLoadingOverride { handler: Box<dyn Fn(String) -> bool> };
   ON_LOAD_HANDLER = UnsafeOnPageLoadHandler { handler: Box<dyn Fn(PageLoadEvent, String)> };
 }
 
-pub static WITH_ASSET_LOADER: OnceCell<bool> = OnceCell::new();
-pub static ASSET_LOADER_DOMAIN: OnceCell<String> = OnceCell::new();
+pub static WITH_ASSET_LOADER: StaticCell<Option<bool>> = StaticCell(RefCell::new(None));
+pub static ASSET_LOADER_DOMAIN: StaticCell<Option<String>> = StaticCell(RefCell::new(None));
 
 pub(crate) static PACKAGE: OnceCell<String> = OnceCell::new();
 
+type EvalCallback = Box<dyn Fn(String) + Send + 'static>;
+
+pub static EVAL_ID_GENERATOR: Counter = Counter::new();
+pub static EVAL_CALLBACKS: OnceCell<Mutex<HashMap<i32, EvalCallback>>> = OnceCell::new();
+
 /// Sets up the necessary logic for wry to be able to create the webviews later.
+///
+/// This function must be run on the thread where the [`JNIEnv`] is registered and the looper is local,
+/// hence the requirement for a [`ThreadLooper`].
 pub unsafe fn android_setup(
   package: &str,
   mut env: JNIEnv,
-  looper: &ForeignLooper,
+  looper: &ThreadLooper,
   activity: GlobalRef,
 ) {
   PACKAGE.get_or_init(move || package.to_string());
@@ -98,35 +131,38 @@ pub unsafe fn android_setup(
   };
 
   looper
-    .add_fd_with_callback(MAIN_PIPE[0], FdEvent::INPUT, move |_| {
+    .add_fd_with_callback(MAIN_PIPE[0].as_fd(), FdEvent::INPUT, move |fd, _event| {
       let size = std::mem::size_of::<bool>();
       let mut wake = false;
-      if libc::read(MAIN_PIPE[0], &mut wake as *mut _ as *mut _, size) == size as libc::ssize_t {
-        main_pipe.recv().is_ok()
+      if libc::read(fd.as_raw_fd(), &mut wake as *mut _ as *mut _, size) == size as libc::ssize_t {
+        let res = main_pipe.recv();
+        // unregister itself on errors or destroy event
+        matches!(res, Ok(MainPipeState::Alive))
       } else {
+        // unregister itself
         false
       }
     })
     .unwrap();
 }
 
-pub(crate) struct InnerWebView;
+pub(crate) struct InnerWebView {
+  id: String,
+}
 
 impl InnerWebView {
   pub fn new_as_child(
-    _window: &impl raw_window_handle::HasRawWindowHandle,
+    _window: &impl HasWindowHandle,
     attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
-    _web_context: Option<&mut WebContext>,
   ) -> Result<Self> {
-    Self::new(_window, attributes, pl_attrs, _web_context)
+    Self::new(_window, attributes, pl_attrs)
   }
 
   pub fn new(
-    _window: &impl raw_window_handle::HasRawWindowHandle,
+    _window: &impl HasWindowHandle,
     attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
-    _web_context: Option<&mut WebContext>,
   ) -> Result<Self> {
     let WebViewAttributes {
       url,
@@ -151,24 +187,29 @@ impl InnerWebView {
       https_scheme,
     } = pl_attrs;
 
-    let custom_protocol_scheme = if https_scheme { "https" } else { "http" };
+    let scheme = if https_scheme { "https" } else { "http" };
 
-    let url = if let Some(u) = url {
-      let mut url_string = String::from(u.as_str());
-      let name = u.scheme();
-      let is_custom_protocol = custom_protocols.iter().any(|(n, _)| n == name);
-      if is_custom_protocol {
-        url_string = u.as_str().replace(
-          &format!("{name}://"),
-          &format!("{custom_protocol_scheme}://{name}."),
-        )
+    let url = if let Some(mut url) = url {
+      if let Some(pos) = url.find("://") {
+        let name = &url[..pos];
+        let is_custom_protocol = custom_protocols.iter().any(|(n, _)| n == name);
+        if is_custom_protocol {
+          url = url.replace(&format!("{name}://"), &format!("{scheme}://{name}."))
+        }
       }
-      Some(url_string)
+
+      Some(url)
     } else {
       None
     };
 
+    let id = attributes
+      .id
+      .map(|id| id.to_string())
+      .unwrap_or_else(|| COUNTER.next().to_string());
+
     MainPipe::send(WebViewMessage::CreateWebView(CreateWebViewAttributes {
+      id: id.clone(),
       url,
       html,
       #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -179,117 +220,136 @@ impl InnerWebView {
       on_webview_created,
       autoplay,
       user_agent,
+      initialization_scripts: initialization_scripts.clone(),
     }));
 
-    WITH_ASSET_LOADER.get_or_init(move || with_asset_loader);
+    WITH_ASSET_LOADER.replace(Some(with_asset_loader));
     if let Some(domain) = asset_loader_domain {
-      ASSET_LOADER_DOMAIN.get_or_init(move || domain);
+      ASSET_LOADER_DOMAIN.replace(Some(domain));
     }
 
-    REQUEST_HANDLER.get_or_init(move || {
-      UnsafeRequestHandler::new(Box::new(move |mut request| {
-        if let Some(custom_protocol) = custom_protocols.iter().find(|(name, _)| {
-          request
-            .uri()
-            .to_string()
-            .starts_with(&format!("{custom_protocol_scheme}://{}.", name))
-        }) {
-          *request.uri_mut() = request
-            .uri()
-            .to_string()
-            .replace(
-              &format!("{custom_protocol_scheme}://{}.", custom_protocol.0),
-              &format!("{}://", custom_protocol.0),
-            )
-            .parse()
-            .unwrap();
+    REQUEST_HANDLER.replace(Some(
+      UnsafeRequestHandler::new(Box::new(
+        move |webview_id: &str, mut request, is_document_start_script_enabled| {
+          let uri = request.uri().to_string();
+          if let Some((custom_protocol_uri, custom_protocol_closure)) = custom_protocols.iter().find(|(name, _)| {
+            uri.starts_with(&format!("{scheme}://{}.", name))
+          }) {
+            let uri_res = uri
+              .replace(
+                &format!("{scheme}://{}.", custom_protocol_uri),
+                &format!("{}://", custom_protocol_uri),
+              )
+              .parse();
 
-          let (tx, rx) = channel();
-          let initialization_scripts = initialization_scripts.clone();
-          let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
-            Box::new(move |mut response| {
-              let should_inject_scripts = response
-                .headers()
-                .get(CONTENT_TYPE)
-                // Content-Type must begin with the media type, but is case-insensitive.
-                // It may also be followed by any number of semicolon-delimited key value pairs.
-                // We don't care about these here.
-                // source: https://httpwg.org/specs/rfc9110.html#rfc.section.8.3.1
-                .and_then(|content_type| content_type.to_str().ok())
-                .map(|content_type_str| content_type_str.to_lowercase().starts_with("text/html"))
-                .unwrap_or_default();
+            if let Ok(uri) = uri_res {
+              *request.uri_mut() = uri;
+            }
 
-              if should_inject_scripts && !initialization_scripts.is_empty() {
-                let mut document =
-                  kuchiki::parse_html().one(String::from_utf8_lossy(response.body()).into_owned());
-                let csp = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY);
-                let mut hashes = Vec::new();
-                with_html_head(&mut document, |head| {
-                  // iterate in reverse order since we are prepending each script to the head tag
-                  for script in initialization_scripts.iter().rev() {
-                    let script_el =
-                      NodeRef::new_element(QualName::new(None, ns!(html), "script".into()), None);
-                    script_el.append(NodeRef::new_text(script));
-                    head.prepend(script_el);
-                    if csp.is_some() {
-                      hashes.push(hash_script(script));
+            let (tx, rx) = channel();
+            let initialization_scripts = initialization_scripts.clone();
+            let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
+              Box::new(move |mut response| {
+                if !is_document_start_script_enabled {
+                  #[cfg(feature = "tracing")]
+                  tracing::info!("`addDocumentStartJavaScript` is not supported; injecting initialization scripts via custom protocol handler");
+                  let should_inject_scripts = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    // Content-Type must begin with the media type, but is case-insensitive.
+                    // It may also be followed by any number of semicolon-delimited key value pairs.
+                    // We don't care about these here.
+                    // source: https://httpwg.org/specs/rfc9110.html#rfc.section.8.3.1
+                    .and_then(|content_type| content_type.to_str().ok())
+                    .map(|content_type_str| {
+                      content_type_str.to_lowercase().starts_with("text/html")
+                    })
+                    .unwrap_or_default();
+
+                  if should_inject_scripts && !initialization_scripts.is_empty() {
+                    let mut document = kuchiki::parse_html()
+                      .one(String::from_utf8_lossy(response.body()).into_owned());
+                    let csp = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY);
+                    let mut hashes = Vec::new();
+                    with_html_head(&mut document, |head| {
+                      // iterate in reverse order since we are prepending each script to the head tag
+                      for (script, _) in initialization_scripts.iter().rev() {
+                        let script_el = NodeRef::new_element(
+                          QualName::new(None, ns!(html), "script".into()),
+                          None,
+                        );
+                        script_el.append(NodeRef::new_text(script.as_str()));
+                        head.prepend(script_el);
+                        if csp.is_some() {
+                          hashes.push(hash_script(script.as_str()));
+                        }
+                      }
+                    });
+
+                    if let Some(csp) = csp {
+                      let csp_string = csp.to_str().unwrap().to_string();
+                      let csp_string = if csp_string.contains("script-src") {
+                        csp_string
+                          .replace("script-src", &format!("script-src {}", hashes.join(" ")))
+                      } else {
+                        format!("{} script-src {}", csp_string, hashes.join(" "))
+                      };
+                      *csp = HeaderValue::from_str(&csp_string).unwrap();
                     }
-                  }
-                });
 
-                if let Some(csp) = csp {
-                  let csp_string = csp.to_str().unwrap().to_string();
-                  let csp_string = if csp_string.contains("script-src") {
-                    csp_string.replace("script-src", &format!("script-src {}", hashes.join(" ")))
-                  } else {
-                    format!("{} script-src {}", csp_string, hashes.join(" "))
-                  };
-                  *csp = HeaderValue::from_str(&csp_string).unwrap();
+                    *response.body_mut() = document.to_string().into_bytes().into();
+                  }
                 }
 
-                *response.body_mut() = document.to_string().into_bytes().into();
-              }
+                tx.send(response).unwrap();
+              });
 
-              tx.send(response).unwrap();
-            });
-
-          (custom_protocol.1)(request, RequestAsyncResponder { responder });
-          return Some(rx.recv().unwrap());
-        }
-        None
-      }))
-    });
+            (custom_protocol_closure)(webview_id, request, RequestAsyncResponder { responder });
+            return Some(rx.recv_timeout(MAIN_PIPE_TIMEOUT).unwrap());
+          }
+          None
+        },
+      ))
+    ));
 
     if let Some(i) = ipc_handler {
-      IPC.get_or_init(move || UnsafeIpc::new(Box::new(i)));
+      IPC.replace(Some(UnsafeIpc::new(Box::new(i))));
     }
 
     if let Some(i) = attributes.document_title_changed_handler {
-      TITLE_CHANGE_HANDLER.get_or_init(move || UnsafeTitleHandler::new(i));
+      TITLE_CHANGE_HANDLER.replace(Some(UnsafeTitleHandler::new(i)));
     }
 
     if let Some(i) = attributes.navigation_handler {
-      URL_LOADING_OVERRIDE.get_or_init(move || UnsafeUrlLoadingOverride::new(i));
+      URL_LOADING_OVERRIDE.replace(Some(UnsafeUrlLoadingOverride::new(i)));
     }
 
     if let Some(h) = attributes.on_page_load_handler {
-      ON_LOAD_HANDLER.get_or_init(move || UnsafeOnPageLoadHandler::new(h));
+      ON_LOAD_HANDLER.replace(Some(UnsafeOnPageLoadHandler::new(h)));
     }
 
-    Ok(Self)
+    Ok(Self { id })
   }
 
-  pub fn print(&self) {}
+  pub fn print(&self) -> crate::Result<()> {
+    Ok(())
+  }
 
-  pub fn url(&self) -> Url {
+  pub fn id(&self) -> crate::WebViewId {
+    &self.id
+  }
+
+  pub fn url(&self) -> crate::Result<String> {
     let (tx, rx) = bounded(1);
     MainPipe::send(WebViewMessage::GetUrl(tx));
-    let uri = rx.recv().unwrap();
-    Url::parse(uri.as_str()).unwrap()
+    rx.recv_timeout(MAIN_PIPE_TIMEOUT).map_err(Into::into)
   }
 
-  pub fn eval(&self, js: &str, _callback: Option<impl Fn(String) + Send + 'static>) -> Result<()> {
-    MainPipe::send(WebViewMessage::Eval(js.into()));
+  pub fn eval(&self, js: &str, callback: Option<impl Fn(String) + Send + 'static>) -> Result<()> {
+    MainPipe::send(WebViewMessage::Eval(
+      js.into(),
+      callback.map(|c| Box::new(c) as Box<dyn Fn(String) + Send + 'static>),
+    ));
     Ok(())
   }
 
@@ -304,19 +364,28 @@ impl InnerWebView {
     false
   }
 
-  pub fn zoom(&self, _scale_factor: f64) {}
+  pub fn zoom(&self, _scale_factor: f64) -> Result<()> {
+    Ok(())
+  }
 
   pub fn set_background_color(&self, background_color: RGBA) -> Result<()> {
     MainPipe::send(WebViewMessage::SetBackgroundColor(background_color));
     Ok(())
   }
 
-  pub fn load_url(&self, url: &str) {
+  pub fn load_url(&self, url: &str) -> Result<()> {
     MainPipe::send(WebViewMessage::LoadUrl(url.to_string(), None));
+    Ok(())
   }
 
-  pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) {
+  pub fn load_url_with_headers(&self, url: &str, headers: http::HeaderMap) -> Result<()> {
     MainPipe::send(WebViewMessage::LoadUrl(url.to_string(), Some(headers)));
+    Ok(())
+  }
+
+  pub fn load_html(&self, html: &str) -> Result<()> {
+    MainPipe::send(WebViewMessage::LoadHtml(html.to_string()));
+    Ok(())
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
@@ -324,20 +393,38 @@ impl InnerWebView {
     Ok(())
   }
 
-  pub fn set_position(&self, _position: (i32, i32)) {
-    // Unsupported.
+  pub fn cookies_for_url(&self, url: &str) -> Result<Vec<cookie::Cookie<'static>>> {
+    let (tx, rx) = bounded(1);
+    MainPipe::send(WebViewMessage::GetCookies(tx, url.to_string()));
+    rx.recv_timeout(MAIN_PIPE_TIMEOUT).map_err(Into::into)
   }
 
-  pub fn set_size(&self, _size: (u32, u32)) {
-    // Unsupported.
+  pub fn cookies(&self) -> Result<Vec<cookie::Cookie<'static>>> {
+    Ok(Vec::new())
   }
 
-  pub fn set_visible(&self, _visible: bool) {
+  pub fn bounds(&self) -> Result<crate::Rect> {
+    Ok(crate::Rect::default())
+  }
+
+  pub fn set_bounds(&self, _bounds: crate::Rect) -> Result<()> {
     // Unsupported
+    Ok(())
   }
 
-  pub fn focus(&self) {
+  pub fn set_visible(&self, _visible: bool) -> Result<()> {
     // Unsupported
+    Ok(())
+  }
+
+  pub fn focus(&self) -> Result<()> {
+    // Unsupported
+    Ok(())
+  }
+
+  pub fn focus_parent(&self) -> Result<()> {
+    // Unsupported
+    Ok(())
   }
 }
 
@@ -358,7 +445,7 @@ impl JniHandle {
 pub fn platform_webview_version() -> Result<String> {
   let (tx, rx) = bounded(1);
   MainPipe::send(WebViewMessage::GetWebViewVersion(tx));
-  rx.recv().unwrap()
+  rx.recv_timeout(MAIN_PIPE_TIMEOUT).unwrap()
 }
 
 fn with_html_head<F: FnOnce(&NodeRef)>(document: &mut NodeRef, f: F) {

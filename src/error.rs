@@ -5,49 +5,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
+  #[cfg(gtk)]
   #[error(transparent)]
   GlibError(#[from] gtk::glib::Error),
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
+  #[cfg(gtk)]
   #[error(transparent)]
   GlibBoolError(#[from] gtk::glib::BoolError),
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
+  #[cfg(gtk)]
   #[error("Fail to fetch security manager")]
   MissingManager,
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
+  #[cfg(gtk)]
   #[error("Couldn't find X11 Display")]
   X11DisplayNotFound,
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
+  #[cfg(gtk)]
   #[error(transparent)]
   XlibError(#[from] x11_dl::error::OpenError),
   #[error("Failed to initialize the script")]
@@ -58,21 +28,18 @@ pub enum Error {
   NulError(#[from] std::ffi::NulError),
   #[error(transparent)]
   ReceiverError(#[from] std::sync::mpsc::RecvError),
+  #[cfg(target_os = "android")]
+  #[error(transparent)]
+  ReceiverTimeoutError(#[from] crossbeam_channel::RecvTimeoutError),
   #[error(transparent)]
   SenderError(#[from] std::sync::mpsc::SendError<String>),
   #[error("Failed to send the message")]
   MessageSender,
-  #[error(transparent)]
-  Json(#[from] serde_json::Error),
-  #[error(transparent)]
-  UrlError(#[from] url::ParseError),
   #[error("IO error: {0}")]
   Io(#[from] std::io::Error),
   #[cfg(target_os = "windows")]
   #[error("WebView2 error: {0}")]
   WebView2Error(webview2_com::Error),
-  #[error("Duplicate custom protocol registered: {0}")]
-  DuplicateCustomProtocol(String),
   #[error(transparent)]
   HttpError(#[from] http::Error),
   #[error("Infallible error, something went really wrong: {0}")]
@@ -88,4 +55,20 @@ pub enum Error {
   UnsupportedWindowHandle,
   #[error(transparent)]
   Utf8Error(#[from] std::str::Utf8Error),
+  #[cfg(target_os = "android")]
+  #[error(transparent)]
+  CrossBeamRecvError(#[from] crossbeam_channel::RecvError),
+  #[error("not on the main thread")]
+  NotMainThread,
+  #[error("Custom protocol task is invalid.")]
+  CustomProtocolTaskInvalid,
+  #[error("Failed to register URL scheme: {0}, could be due to invalid URL scheme or the scheme is already registered.")]
+  UrlSchemeRegisterError(String),
+  #[error("Duplicate custom protocol registered on Linux: {0}")]
+  DuplicateCustomProtocol(String),
+  #[error("Duplicate custom protocol registered on the same web context on Linux: {0}")]
+  ContextDuplicateCustomProtocol(String),
+  #[error(transparent)]
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  UrlPrase(#[from] url::ParseError),
 }
